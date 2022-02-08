@@ -191,11 +191,11 @@ def main(i):
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(tqdm(dataloader, desc="Iteration")):
-                input_data = convert_examples_to_features(batch[0]["captions"], 640, tokenizer)
+                input_data = convert_examples_to_features(batch[0]["captions"], 512, tokenizer)
                 input_ids = torch.tensor([f["input_ids"] for f in input_data], dtype=torch.long)[:50,:]
                 input_mask = torch.tensor([f["input_mask"] for f in input_data], dtype=torch.long)[:50,:]
                 segment_ids = torch.tensor([f["segment_ids"] for f in input_data], dtype=torch.long)[:50,:]
-                train_audio = batch[0]["expert"][:50,:]
+                train_audio = batch[0]["expert"][:50,:512]
                 query_index = batch[0]["query_index"]
                 label_index = batch[0]["label_index"]
 
