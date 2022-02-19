@@ -198,7 +198,7 @@ def main(i):
                 train_audio = batch[0]["expert"][:50,:512]
                 query_index = batch[0]["query_index"]
                 label_index = batch[0]["label_index"]
-
+                label = batch[0]["label"]
                 loss = model(input_ids, train_audio, segment_ids, input_mask, query_index, label_index)
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps

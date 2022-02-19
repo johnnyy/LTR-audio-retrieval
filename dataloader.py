@@ -70,15 +70,20 @@ class BaseDataset(Dataset):
             index_label = np.argwhere(self.indices[idx] == idx)
             if index_label.size == 0:
                 index_label = None
+                label = None
+
             else:
                 index_label = index_label[0][0]
+                label = np.zeros(len(rank_pos))
+                label[index_label] = 1
 
             result = {
                 "query_index": idx,
                 "rank_pos": rank_pos,
                 "expert": experts,
                 "captions": captions,
-                "label_index": index_label
+                "label_index": index_label,
+                "label": label,
             }
             return result
 
