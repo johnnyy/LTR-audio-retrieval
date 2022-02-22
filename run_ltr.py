@@ -1,250 +1,156 @@
-"""BERT finetuning runner."""
-from __future__ import absolute_import, division, print_function
-import argparse
-import os
+
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, TensorDataset)
-from tqdm import tqdm, trange
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE,cached_path
-from model import BertForSequenceClassification, BertConfig, WEIGHTS_NAME, CONFIG_NAME
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
-from utils import *
-import pickle
-from sklearn.metrics import precision_score, recall_score, f1_score
-import matplotlib.pyplot as plt
-import itertools
-from sklearn.metrics import confusion_matrix,accuracy_score
-from sklearn import metrics
-from dataloader import BaseDataset
 
-#单GPU
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+from torch import cuda
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+from model import CrossModalBERT
+
+from dataloader import BaseDataset, EvaluateDataset
 
 
-"""BERT finetuning runner."""
-def main(i):
-    parser = argparse.ArgumentParser()
+def evaluate(model, test_dataloader, tokenizer, window_size):
+    recall = 0
+    model.eval()
+    index_corrects = np.repeat(np.arange(0, test_dataloader.dataset.__len__() / 5), 5).reshape(
+        test_dataloader.dataset.__len__(), 1)
+    with torch.no_grad():
+        classname = {0: 'Irrelevant', 1: 'Relevant'}
+        correct_pred = defaultdict(lambda: 0)
+        total_pred = defaultdict(lambda: 0)
 
-    ## Required parameters
-    parser.add_argument("--data_dir", default='data/text', type=str,
-                        help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-    parser.add_argument("--bert_model", default='pre-trained BERT', type=str,
-                        help="Bert pre-trained model selected in the list: bert-base-uncased, "
-                        "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
-                        "bert-base-multilingual-cased, bert-base-chinese.")
-    parser.add_argument("--task_name", default='Multi', type=str,
-                        help="The name of the task to train.")
-    parser.add_argument("--output_dir", default='CM-BERT_output', type=str,
-                        help="The output directory where the model predictions and checkpoints will be written.")
+        for inputs in test_dataloader:
+            y_pred = []
 
-    ## Other parameters
-    parser.add_argument("--cache_dir", default="", type=str,
-                        help="Where do you want to store the pre-trained models downloaded from s3")
-    parser.add_argument("--max_seq_length", default=50, type=int,
-                        help="The maximum total input sequence length after WordPiece tokenization. \n"
-                             "Sequences longer than this will be truncated, and sequences shorter \n"
-                             "than this will be padded.")
-    parser.add_argument("--do_train", default=True,
-                        help="Whether to run training.'store_true'")
-    parser.add_argument("--do_test", default=True,
-                        help="Whether to run eval on the dev set.")
-    parser.add_argument("--do_lower_case", default=True,
-                        help="Set this flag if you are using an uncased model.")
-    parser.add_argument("--train_batch_size", default=1, type=int,
-                        help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=1, type=int,
-                        help="Total batch size for eval.")
-    parser.add_argument("--test_batch_size", default=1, type=int,
-                        help="Total batch size for test.")
-    parser.add_argument("--learning_rate", default=2e-5, type=float,
-                        help="The initial learning rate for Adam.5e-5")
-    parser.add_argument("--num_train_epochs", default=3.0, type=float,
-                        help="Total number of training epochs to perform.")
-    parser.add_argument("--warmup_proportion", default=0.1, type=float,
-                        help="Proportion of training to perform linear learning rate warmup for. "
-                             "E.g., 0.1 = 10%% of training.")
-    parser.add_argument("--no_cuda", action='store_true',
-                        help="Whether not to use CUDA when available")
-    parser.add_argument('--seed', type=int, default=11111,
-                        help="random seed for initialization")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
-    args = parser.parse_args()
-    processors = {
-        "multi": PgProcessor,
-    }
+            expert = inputs[0]["expert"]
+            data = tokenizer(
+                inputs[0]["captions"],
+                truncation=True,
+                return_tensors="pt",
+                max_length=150,
+                padding='max_length')
+            index_true = inputs[0]["label_index"]
 
-    num_labels_task = {
-        "multi": 1,
-    }
+            labels = inputs[0]["label"]
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    n_gpu = 2
-    logger.info("device: {} n_gpu: {}".format(device, n_gpu))
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(args.gradient_accumulation_steps))
+            if labels is not None and index_true < window_size:
+                labels = torch.tensor(
+                    labels,
+                    dtype=torch.long)
 
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+                input_ids = data["input_ids"]
+                input_ids = input_ids.repeat(expert.shape[0], 1)
 
-    seed_num = np.random.randint(1,10000)
-    random.seed(seed_num)
-    np.random.seed(seed_num)
-    torch.manual_seed(seed_num)
-    if n_gpu > 0:
-        torch.cuda.manual_seed_all(seed_num)
+                attention_mask = data["attention_mask"]
+                attention_mask = attention_mask.repeat(expert.shape[0], 1)
 
-    if not args.do_train and not args.do_test:
-        raise ValueError("At least one of `do_train` or `do_test` must be True.")
+                torch_zeros = torch.zeros((window_size, 1, 145, 145))
+                torch_zeros[:, 0, :128, :] = expert[:window_size].reshape((window_size, 128, 145))
+                for minibatch in range(int(window_size / 100)):
+                    range_index = list(range(100 * minibatch, 100 * (minibatch + 1)))
+                    target = labels[range_index]
 
-    if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
-        raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+                    output = model(
+                        input_ids[range_index],
+                        attention_mask[range_index],
+                        torch_zeros[range_index])
 
-    task_name = args.task_name.lower()
+                    y_pred += list(output[:, 1].to('cpu'))
 
-    if task_name not in processors:
-        raise ValueError("Task not found: %s" % (task_name))
+                top_10_rerank = np.argsort(y_pred)[:10] == index_true
+                recall_consult = top_10_rerank.sum()
+            else:
+                recall_consult = 0
 
-    processor = processors[task_name]()
-    num_labels = num_labels_task[task_name]
-    label_list = processor.get_labels()
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+            recall += recall_consult / test_dataloader.dataset.__len__()
+        return recall
 
-    bd_dataset = BaseDataset("FAZER", args.do_train)
-    dataloader = DataLoader(
-        dataset=bd_dataset,
+
+
+def main(n_epochs):
+    window_size = 300
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    #load data (train/test)
+    evaluate_dataset = EvaluateDataset("AA")
+    evaluate_dataloader = DataLoader(
+        dataset=evaluate_dataset,
         batch_size=1,
         num_workers=1,
         shuffle=True,
-        collate_fn=bd_dataset.collate_data,
-
+        collate_fn=evaluate_dataset.collate_data,
+    )
+    train_dataset = BaseDataset("AA")
+    train_dataloader = DataLoader(
+        dataset=train_dataset,
+        batch_size=1,
+        num_workers=1,
+        shuffle=True,
+        collate_fn=dl.collate_data,
     )
 
-    # Prepare model
-    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE),
-                                                                   'distributed_{}'.format("-1"))
-    ##############################################################################################################
-    model = BertForSequenceClassification.from_pretrained(args.bert_model, cache_dir=cache_dir,
-                                                          num_labels=num_labels)
-    # Freezing all layer except for last transformer layer and its follows
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if "encoder.layer.0" in name or "encoder.layer.1" in name:
-            param.requires_grad = True
-        if "encoder.layer.2" in name or "encoder.layer.3" in name:
-            param.requires_grad = True
-        if "encoder.layer.4" in name or "encoder.layer.5" in name:
-            param.requires_grad = True
-        if "encoder.layer.6" in name or "encoder.layer.7" in name:
-            param.requires_grad = True
-        if "encoder.layer.8" in name or "encoder.layer.9" in name:
-            param.requires_grad = True
-        if "encoder.layer.10" in name or "encoder.layer.11" in name:
-            param.requires_grad = True
-        if "BertFinetun" in name or "pooler" in name:
-            param.requires_grad = True
-        ##############################################################################################################
-    model.to(device)
 
-    if n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    #load model
+    optimizer = torch.optim.Adam(params=model.parameters(), lr=LEARNING_RATE)
+    loss = torch.nn.CrossEntropyLoss()
 
-    # Prepare optimizer
-    param_optimizer = list(model.named_parameters())
+    model = CrossModalBERT()
+    model.to('cpu')
+    model.train()
+    for epoch in range(n_epochs):
 
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    new_decay = ['BertFine']
+        for step, batch in enumerate(train_dataloader):
+            expert = batch[0]["expert"]
+            data = tokenizer(
+                batch[0]["captions"],
+                truncation=True,
+                return_tensors="pt",
+                max_length=150,
+                padding='max_length')
+            index_true = batch[0]["label_index"]
+            labels = batch[0]["label"]
+            if labels is not None and index_true < window_size:
+                labels = torch.tensor(
+                    labels,
+                    dtype=torch.long)
 
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if
-                    not any(nd in n for nd in no_decay) and not any(np in n for np in new_decay)],
-         'weight_decay': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
-        {'params': [p for n, p in param_optimizer if
-                    not any(nd in n for nd in no_decay) and any(np in n for np in new_decay)], 'lr': 0.01}
-    ]
+                input_ids = data["input_ids"]
+                input_ids = input_ids.repeat(expert.shape[0], 1)
 
+                attention_mask = data["attention_mask"]
+                attention_mask = attention_mask.repeat(expert.shape[0], 1)
 
+                torch_zeros = torch.zeros((window_size, 1, 145, 145))
+                torch_zeros[:, 0, :128, :] = expert[:window_size].reshape((window_size, 128, 145))
+                for minibatch in range(int(window_size / 50)):
 
-    global_step = 0
-    nb_tr_steps = 0
-    tr_loss = 0
-    max_acc = 0
-    min_loss = 100
-    if args.do_train:
-        num_train_optimization_steps = int(dataloader.__len__() / args.train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+                    range_index = list(range(50 * (minibatch), 50 * (minibatch + 1)))
+                    range_index.append(index_true)
 
-        logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", dataloader.__len__())
-        logger.info("  Batch size = %d", args.train_batch_size)
-        logger.info("  Num steps = %d", num_train_optimization_steps)
+                    target = labels[range_index]
 
-        for _ in trange(int(args.num_train_epochs), desc="Epoch"):
-            model.train()
-            tr_loss = 0
-            nb_tr_examples, nb_tr_steps = 0, 0
-            for step, batch in enumerate(tqdm(dataloader, desc="Iteration")):
-                input_data = convert_examples_to_features(batch[0]["captions"], 512, tokenizer)
-                input_ids = torch.tensor([f["input_ids"] for f in input_data], dtype=torch.long)[:50,:]
-                input_mask = torch.tensor([f["input_mask"] for f in input_data], dtype=torch.long)[:50,:]
-                segment_ids = torch.tensor([f["segment_ids"] for f in input_data], dtype=torch.long)[:50,:]
-                train_audio = batch[0]["expert"][:50,:512]
-                query_index = batch[0]["query_index"]
-                label_index = batch[0]["label_index"]
-                label = batch[0]["label"]
-                loss = model(input_ids, train_audio, segment_ids, input_mask, query_index, label_index)
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-                loss.backward()
+                    output = model(
+                        input_ids[range_index],
+                        attention_mask[range_index],
+                        torch_zeros[range_index])
 
-                tr_loss += loss.item()
-                nb_tr_examples += input_ids.size(0)
-                nb_tr_steps += 1
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    optimizer.step()
                     optimizer.zero_grad()
-                    global_step += 1
+                    l = loss(output, target)
+                    l.backward()
+                    optimizer.step()
 
-                import pdb;
-                pdb.set_trace()
-                print(step)
+                    if step % 10 == 0:
+                        print(f'Epoch: {epoch}, {step}/{len(dataloader)}, Loss:  {l.item()}')
 
+            recall = evaluate(model, evaluate_dataloader, tokenizer, 100)
+            print(f"Epoch:{epoch}, evaluate recall: {recall}")
 
 if __name__ == "__main__":
-    acc_list = []
-    F1_list = []
-    mae_list= []
-    corr_list = []
-    acc7_list = []
-    for i in range(5):
-        os.system('mkdir CM-BERT_output')
-        results = main(i)
-        acc_list.append(str(results['acc']))
-        F1_list.append(str(results['F1']))
-        mae_list.append(str(results['mae']))
-        corr_list.append(str(results['corr']))
-        acc7_list.append(str(results['acc7']))
-        os.system('rm -r CM-BERT_output')
-
-    acc_array = np.array(acc_list).astype(float)
-    F1_array = np.array(F1_list).astype(float)
-    mae_array = np.array(mae_list).astype(float)
-    corr_array = np.array(corr_list).astype(float)
-    acc7_array = np.array(acc7_list).astype(float)
-    acc_list.append(np.mean(acc_array))
-    F1_list.append(np.mean(F1_array))
-    mae_list.append(np.mean(mae_array))
-    corr_list.append(np.mean(corr_array))
-    acc7_list.append(np.mean(acc7_array))
-    print('acc:', acc_list)
-    print('F1:', F1_list)
-    print('mae:', mae_list)
-    print('corr:', corr_list)
-    print('acc7:', acc7_list)
+    n_epochs = 100
+    main(n_epochs)
